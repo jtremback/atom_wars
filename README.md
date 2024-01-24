@@ -2,6 +2,7 @@
 
 ## Endpoints
 
+```
 LockTokens(lock_duration):
     Receive tokens
     Validate against whitelist
@@ -60,9 +61,11 @@ RefundTribute(prop_id):
 Migrate:
     Use a migrate message only open to an admin to update params such as denom whitelist
     Set the Hub's ICA account as the admin
+```
 
 ## State
 
+```
 LocksMap: key(sender_address, lock_id) -> {
     amount: Coin,
     lock_start: Timestamp,
@@ -91,6 +94,7 @@ TributeMap: key(prop_id, tribute_id) -> {
     sender: Address,
     amount: Coin
 }
+```
 
 ## Notes
 
