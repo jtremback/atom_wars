@@ -5,8 +5,7 @@
 ```
 LockTokens(lock_duration):
     Receive tokens
-    Validate against whitelist
-    Deposit funds in contract's account
+    Validate against denom whitelist
     Create entry in LocksMap
 
 UnlockTokens():
@@ -17,7 +16,6 @@ UnlockTokens():
 
 CreateProposal(covenant_params, tribute):
     Validate covenant_params
-    Instantiate covenant using factory
     Hold tribute in contract's account
     Create in PropMap
 
@@ -86,7 +84,7 @@ VoteMap: key() -> {
 
 RoundMap: key(round_id) -> {
     round_id: u64,
-    round_end: Timestamp
+    round_end: Timestamp,
     winners
 }
 
