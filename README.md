@@ -56,6 +56,17 @@ RefundTribute(prop_id):
     Check that prop_id is a losing prop from a previous round
     Iterate all tributes for that prop id:
 
+ClaimTribute(round_id, prop_id):
+    Check that the round is ended
+    Check that the prop won
+    Look up sender's vote for the round
+    Check that the sender voted for the prop
+    Check that the sender has not already claimed the tribute
+    Divide sender's vote power by total power voting for the prop to figure out their percentage
+    Iterate all tributes for that vote:
+        Use the sender's percentage to send them the right portion of the tribute
+    Mark on the sender's vote that they claimed the tribute
+
 Migrate:
     Use a migrate message only open to an admin to update params such as denom whitelist
     Set the Hub's ICA account as the admin

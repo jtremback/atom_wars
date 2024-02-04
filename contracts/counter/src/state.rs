@@ -49,17 +49,18 @@ pub struct Proposal {
     pub power: Uint128,
 }
 
-// VoteMap: key() -> {
+// VoteMap: key(round_id, sender_addr) -> {
 //     prop_id: u64,
 //     sender_address: Address
 //     power: Uint128
 // }
-pub const VOTE_MAP: Map<Addr, Vote> = Map::new("vote_map");
+pub const VOTE_MAP: Map<(u64, Addr), Vote> = Map::new("vote_map");
 
 #[cw_serde]
 pub struct Vote {
     pub prop_id: u64,
     pub power: Uint128,
+    pub tribute_claimed: bool,
 }
 
 // RoundMap: key(round_id) -> {
@@ -75,11 +76,11 @@ pub struct Round {
     pub round_end: Timestamp,
 }
 
-// TributeMap: key(prop_id, tribute_id) -> {
+// TributeMap: key(round_id, prop_id, tribute_id) -> {
 //     sender: Address,
 //     amount: Coin
 // }
-pub const TRIBUTE_MAP: Map<(u64, u64), Tribute> = Map::new("tribute_map");
+pub const TRIBUTE_MAP: Map<(u64, u64, u64), Tribute> = Map::new("tribute_map");
 
 #[cw_serde]
 pub struct Tribute {

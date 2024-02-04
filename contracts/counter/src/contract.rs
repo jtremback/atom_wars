@@ -7,7 +7,7 @@ use crate::error::ContractError;
 use crate::msg::{CountResponse, ExecuteMsg, InstantiateMsg, QueryMsg};
 use crate::state::{
     Constants, LockEntry, Proposal, Round, Vote, CONSTANTS, LOCKS_MAP, LOCK_ID, PROP_ID, PROP_MAP,
-    ROUND_ID, ROUND_MAP, TRIBUTE_ID, VOTE_MAP,
+    ROUND_ID, ROUND_MAP, TRIBUTE_ID, TRIBUTE_MAP, VOTE_MAP,
 };
 use osmosis_std::types::osmosis::tokenfactory::v1beta1::{MsgBurn, MsgMint};
 
@@ -292,12 +292,99 @@ fn execute_proposal(
 }
 
 fn add_tribute(
-    _deps: DepsMut,
-    _env: Env,
-    _info: MessageInfo,
-    _proposal_id: u64,
+    deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+    round_id: u64,
+    proposal_id: u64,
 ) -> Result<Response, ContractError> {
     Ok(Response::new().add_attribute("action", "add_tribute"))
+}
+
+// ClaimTribute(round_id, prop_id):
+//     Check that the round is ended
+//     Check that the prop won
+//     Look up sender's vote for the round
+//     Check that the sender voted for the prop
+//     Check that the sender has not already claimed the tribute
+//     Divide sender's vote power by total power voting for the prop to figure out their percentage
+//     Iterate all tributes for that vote:
+//         Use the sender's percentage to send them the right portion of the tribute
+//     Mark on the sender's vote that they claimed the tribute
+fn claim_tribute(
+    deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+    round_id: u64,
+    proposal_id: u64,
+    tribute_id: u64,
+) -> Result<Response, ContractError> {
+    // Check that the round is ended by checking that the round_id is not the current round
+    let current_round_id = ROUND_ID.load(deps.storage)?;
+    if round_id == current_round_id {
+        return Err(ContractError::Std(StdError::generic_err(
+            "Round has not ended yet",
+        )));
+    }
+
+    // Check that the prop won
+    let mut max_power = Uint128::zero();
+    let mut max_prop_id = 0;
+    let proposals = PROP_MAP
+        .prefix(round_id)
+        .range(deps.storage, None, None, Order::Ascending);
+
+    for proposal in proposals {
+        let (prop_id, proposal) = proposal?;
+        if proposal.power > max_power {
+            max_power = proposal.power;
+            max_prop_id = prop_id;
+        }
+    }
+
+    if max_prop_id != proposal_id {
+        return Err(ContractError::Std(StdError::generic_err(
+            "Proposal did not win",
+        )));
+    }
+
+    // Look up sender's vote for the round, error if it cannot be found
+    let vote = VOTE_MAP.load(deps.storage, (round_id, info.sender.clone()))?;
+
+    // Check that the sender voted for the prop
+    if vote.prop_id != proposal_id {
+        return Err(ContractError::Std(StdError::generic_err(
+            "Sender did not vote for the proposal",
+        )));
+    }
+
+    // Check that the sender has not already claimed the tribute
+    if vote.tribute_claimed {
+        return Err(ContractError::Std(StdError::generic_err(
+            "Sender has already claimed the tribute",
+        )));
+    }
+
+    // Divide sender's vote power by the prop's power to figure out their percentage
+    let proposal = PROP_MAP.load(deps.storage, (round_id, proposal_id))?;
+    let percentage = vote.power.u128() / proposal.power.u128();
+
+    // Load the tribute and use the percentage to figure out how much of the tribute to send them
+    let tribute = TRIBUTE_MAP.load(deps.storage, (round_id, proposal_id, tribute_id))?;
+    let amount = Uint128::from(tribute.amount() * percentage);
+
+    // Mark on the sender's vote that they claimed the tribute
+    let mut vote = VOTE_MAP.load(deps.storage, (round_id, info.sender.clone()))?;
+    vote.tribute_claimed = true;
+    VOTE_MAP.save(deps.storage, (round_id, info.sender.clone()), &vote)?;
+
+    // Send the tribute to the sender
+    Ok(Response::new()
+        .add_attribute("action", "claim_tribute")
+        .add_message(BankMsg::Send {
+            to_address: info.sender.to_string(),
+            amount: vec![tribute.amount],
+        }))
 }
 
 fn refund_tribute(
