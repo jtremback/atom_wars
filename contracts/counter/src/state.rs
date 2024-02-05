@@ -84,8 +84,12 @@ pub const TRIBUTE_MAP: Map<(u64, u64, u64), Tribute> = Map::new("tribute_map");
 
 #[cw_serde]
 pub struct Tribute {
-    pub sender: Addr,
+    pub depositor: Addr,
     pub amount: Coin,
+    pub refunded: bool,
 }
 
 pub const TALLY_MAP: Map<(u64, u64), Uint128> = Map::new("tally_map");
+
+// WinningProp: key(round_id) -> prop_id
+pub const WINNING_PROP: Map<u64, u64> = Map::new("score_map");

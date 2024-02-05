@@ -17,8 +17,8 @@ pub enum ExecuteMsg {
     Vote { proposal_id: u64 },
     Tally {},
     ExecuteProposal { proposal_id: u64 },
-    AddTribute { proposal_id: u64 },
-    RefundTribute { proposal_id: u64 },
+    AddTribute { round_id: u64, proposal_id: u64 },
+    RefundTribute { round_id: u64, proposal_id: u64 },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
