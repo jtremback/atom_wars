@@ -21,7 +21,7 @@ pub const ROUND_ID: Item<u64> = Item::new("round_id");
 pub const TRIBUTE_ID: Item<u64> = Item::new("tribute_id");
 
 // LocksMap: key(sender_address, lock_id) -> {
-//     amount: Coin,
+//     funds: Coin,
 //     lock_start: Timestamp,
 //     lock_end: Timestamp
 // }
@@ -29,7 +29,7 @@ pub const LOCKS_MAP: Map<(Addr, u64), LockEntry> = Map::new("locks_map");
 
 #[cw_serde]
 pub struct LockEntry {
-    pub amount: Coin,
+    pub funds: Coin,
     pub lock_start: Timestamp,
     pub lock_end: Timestamp,
 }
@@ -85,7 +85,7 @@ pub const TRIBUTE_MAP: Map<(u64, u64, u64), Tribute> = Map::new("tribute_map");
 #[cw_serde]
 pub struct Tribute {
     pub depositor: Addr,
-    pub amount: Coin,
+    pub funds: Coin,
     pub refunded: bool,
 }
 
@@ -93,3 +93,6 @@ pub const TALLY_MAP: Map<(u64, u64), Uint128> = Map::new("tally_map");
 
 // WinningProp: key(round_id) -> prop_id
 pub const WINNING_PROP: Map<u64, u64> = Map::new("score_map");
+
+// TributeClaims: key(sender_addr, tribute_id) -> bool
+pub const TRIBUTE_CLAIMS: Map<(Addr, u64), bool> = Map::new("tribute_claims");

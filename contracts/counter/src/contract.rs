@@ -1,13 +1,35 @@
+// MAIN TODOS:
+// - Handle power scaling and attenuation <- Done
+// - Add real covenant logic
+// - Question: How to design voting so that people don't just wait until the end to vote?
+// - Question: How to handle the case where a proposal is executed but the covenant fails?
+// - Covenant Question: How to deal with someone using MEV to skew the pool ratio right before the liquidity is pulled? Streaming the liquidity pull? You'd have to set up a cron job for that.
+// - Covenant Question: Can people sandwich this whole thing - covenant system has price limits - but we should allow people to retry executing the prop during the round
+// - Question: How to punish people who vote for props that lose money due to IL? Adding their liquid staked positions to the prop position is a non starter mechanically. Instead we should hit their staked positions at the end if there is IL.
+// - - Question: Should they also be exposed to upside?
+// - - Question: At what point do you punish them for the IL? At the end of the round? Should there be failsafes to pull a position once IL breaches a threshold?
+
+// Power scaling function: \left\{x<1:\ 2,\ 1<x<4:\ -5^{\left(x-4.5\right)}+1,\ x>4:\ 0\right\}
+// fn piecewise_function(x: f64) -> f64 {
+//     if x < 1.0 {
+//         2.0 // For x < 1, return 2
+//     } else if x > 4.0 {
+//         0.0 // For x > 4, return 0
+//     } else {
+//         -5.0f64.powf(x - 4.5) + 1.0 // For 1 < x < 4, calculate the expression
+//     }
+// }
+
 use cosmwasm_std::{
-    entry_point, to_json_binary, BankMsg, Binary, Deps, DepsMut, Env, MessageInfo, Order, Response,
-    StdError, StdResult, Timestamp, Uint128,
+    entry_point, to_json_binary, BankMsg, Binary, Coin, Deps, DepsMut, Env, MessageInfo, Order,
+    Response, StdError, StdResult, Timestamp, Uint128,
 };
 
 use crate::error::ContractError;
 use crate::msg::{CountResponse, ExecuteMsg, InstantiateMsg, QueryMsg};
 use crate::state::{
     Constants, LockEntry, Proposal, Round, Tribute, Vote, CONSTANTS, LOCKS_MAP, LOCK_ID, PROP_ID,
-    PROP_MAP, ROUND_ID, ROUND_MAP, TRIBUTE_ID, TRIBUTE_MAP, VOTE_MAP, WINNING_PROP,
+    PROP_MAP, ROUND_ID, ROUND_MAP, TRIBUTE_CLAIMS, TRIBUTE_ID, TRIBUTE_MAP, VOTE_MAP, WINNING_PROP,
 };
 use osmosis_std::types::osmosis::tokenfactory::v1beta1::{MsgBurn, MsgMint};
 
@@ -68,6 +90,19 @@ fn lock_tokens(
     info: MessageInfo,
     lock_duration: u64,
 ) -> Result<Response, ContractError> {
+    // Validate that their lock duration (given in nanos) is either 1 month, 3 months, 6 months, or 12 months
+    let one_month_in_nanos: u64 = 2629746000000000;
+
+    if lock_duration != one_month_in_nanos
+        && lock_duration != one_month_in_nanos * 3
+        && lock_duration != one_month_in_nanos * 6
+        && lock_duration != one_month_in_nanos * 12
+    {
+        return Err(ContractError::Std(StdError::generic_err(
+            "Lock duration must be 1, 3, 6, or 12 months",
+        )));
+    }
+
     // Validate that sent funds are the required denom
     if info.funds.len() != 1 {
         return Err(ContractError::Std(StdError::generic_err(
@@ -88,7 +123,7 @@ fn lock_tokens(
 
     // Create entry in LocksMap
     let lock_entry = LockEntry {
-        amount: sent_funds.clone(),
+        funds: sent_funds.clone(),
         lock_start: env.block.time,
         lock_end: env.block.time.plus_nanos(lock_duration),
     };
@@ -114,15 +149,22 @@ fn unlock_tokens(deps: DepsMut, env: Env, info: MessageInfo) -> Result<Response,
             .range(deps.storage, None, None, Order::Ascending);
 
     let mut sends = vec![];
+    let mut to_delete = vec![];
 
     for lock in locks {
         let (lock_id, lock_entry) = lock?;
         if lock_entry.lock_end < env.block.time {
-            // Send `amount` tokens back to caller
-            sends.push(lock_entry.amount.clone());
+            // Send tokens back to caller
+            sends.push(lock_entry.funds.clone());
             // Delete entry from LocksMap
-            LOCKS_MAP.remove(deps.storage, (info.sender.clone(), lock_id));
+
+            to_delete.push((info.sender.clone(), lock_id));
         }
+    }
+
+    // Delete unlocked locks
+    for (addr, lock_id) in to_delete {
+        LOCKS_MAP.remove(deps.storage, (addr, lock_id));
     }
 
     Ok(Response::new()
@@ -167,15 +209,44 @@ fn create_proposal(
     Ok(Response::new().add_attribute("action", "create_proposal"))
 }
 
+fn scale_lockup_power(lockup_time: u64, raw_power: Uint128) -> Uint128 {
+    let one_month_in_nanos: u64 = 2629746000000000;
+    let three_months_in_nanos: u64 = one_month_in_nanos * 3;
+    let six_months_in_nanos: u64 = one_month_in_nanos * 6;
+
+    let two: Uint128 = 2u16.into();
+
+    // Scale lockup power
+    // 1x if lockup is between 0 and 1 months
+    // 1.5x if lockup is between 1 and 3 months
+    // 2x if lockup is between 3 and 6 months
+    // 4x if lockup is between 6 and 12 months
+    // TODO: is there a less funky way to do Uint128 math???
+    let scaled_power = match lockup_time {
+        // 4x if lockup is over 6 months
+        lockup_time if lockup_time > one_month_in_nanos * 6 => raw_power * two * two,
+        // 2x if lockup is between 3 and 6 months
+        lockup_time if lockup_time > one_month_in_nanos * 3 => raw_power * two,
+        // 1.5x if lockup is between 1 and 3 months
+        lockup_time if lockup_time > one_month_in_nanos => raw_power + (raw_power / two),
+        // Covers 0 and 1 month which have no scaling
+        _ => raw_power,
+    };
+
+    scaled_power
+}
+
 fn vote(
     deps: DepsMut,
     env: Env,
     info: MessageInfo,
     proposal_id: u64,
 ) -> Result<Response, ContractError> {
-    // Load the proposal
+    // Load the round_id
     let round_id = ROUND_ID.load(deps.storage)?;
-    let proposal = PROP_MAP.load(deps.storage, (round_id, proposal_id))?;
+
+    // Load the round
+    let round = ROUND_MAP.load(deps.storage, round_id)?;
 
     // Get any existing vote and reverse it
     let vote = VOTE_MAP.load(deps.storage, (round_id, info.sender.clone()));
@@ -197,7 +268,15 @@ fn vote(
 
     for lock in locks {
         let (_, lock_entry) = lock?;
-        power += lock_entry.amount.amount;
+
+        // Get the remaining lockup time at the end of this round.
+        // This means that their power will be scaled the same by this function no matter when they vote in the round
+        let lockup_time = lock_entry.lock_end.nanos() - round.round_end.nanos();
+
+        // Scale power. This is what implements the different powers for different lockup times.
+        let scaled_power = scale_lockup_power(lockup_time, lock_entry.funds.amount);
+
+        power += scaled_power;
     }
 
     // Update proposal's power in propmap
@@ -251,7 +330,7 @@ fn end_round(_deps: DepsMut, _env: Env, _info: MessageInfo) -> Result<Response, 
         round_id,
         &Round {
             round_end,
-            round_id: round_id,
+            round_id,
         },
     )?;
     ROUND_ID.save(_deps.storage, &(round_id))?;
@@ -293,7 +372,7 @@ fn execute_proposal(
     }
 
     // Execute proposal
-    do_covenant_stuff(deps, env, info, proposal.covenant_params);
+    // do_covenant_stuff(deps, env, info, proposal.clone().covenant_params);
 
     // Mark proposal as executed
     proposal.executed = true;
@@ -324,11 +403,18 @@ fn add_tribute(
         )));
     }
 
+    // Check that the sender has only sent one type of coin for the tribute
+    if info.funds.len() != 1 {
+        return Err(ContractError::Std(StdError::generic_err(
+            "Must send exactly one coin",
+        )));
+    }
+
     // Create tribute in TributeMap
     let tribute_id = TRIBUTE_ID.load(deps.storage)?;
     TRIBUTE_ID.save(deps.storage, &(tribute_id + 1))?;
     let tribute = Tribute {
-        amount: info.funds[0].clone(),
+        funds: info.funds[0].clone(),
         depositor: info.sender.clone(),
         refunded: false,
     };
@@ -378,8 +464,8 @@ fn claim_tribute(
         )));
     }
 
-    // Check that the sender has not already claimed the tribute
-    if vote.tribute_claimed {
+    // Check that the sender has not already claimed the tribute using the TRIBUTE_CLAIMS map
+    if TRIBUTE_CLAIMS.may_load(deps.storage, (info.sender.clone(), tribute_id))? == Some(true) {
         return Err(ContractError::Std(StdError::generic_err(
             "Sender has already claimed the tribute",
         )));
@@ -387,23 +473,26 @@ fn claim_tribute(
 
     // Divide sender's vote power by the prop's power to figure out their percentage
     let proposal = PROP_MAP.load(deps.storage, (round_id, proposal_id))?;
+    // TODO: percentage needs to be a decimal type
     let percentage = vote.power / proposal.power;
 
     // Load the tribute and use the percentage to figure out how much of the tribute to send them
     let tribute = TRIBUTE_MAP.load(deps.storage, (round_id, proposal_id, tribute_id))?;
-    let amount = Uint128::from(tribute.amount.amount * percentage);
+    let amount = Uint128::from(tribute.funds.amount * percentage);
 
-    // Mark on the sender's vote that they claimed the tribute
-    let mut vote = VOTE_MAP.load(deps.storage, (round_id, info.sender.clone()))?;
-    vote.tribute_claimed = true;
-    VOTE_MAP.save(deps.storage, (round_id, info.sender.clone()), &vote)?;
+    // Mark in the TRIBUTE_CLAIMS that the sender has claimed this tribute
+    TRIBUTE_CLAIMS.save(deps.storage, (info.sender.clone(), tribute_id), &true)?;
 
     // Send the tribute to the sender
     Ok(Response::new()
         .add_attribute("action", "claim_tribute")
         .add_message(BankMsg::Send {
             to_address: info.sender.to_string(),
-            amount: vec![tribute.amount],
+            // TODO: amount needs to be a Coin type- take calculated amount instead of entire tribute amount
+            amount: vec![Coin {
+                denom: tribute.funds.denom,
+                amount,
+            }],
         }))
 }
 
@@ -459,7 +548,7 @@ fn refund_tribute(
         .add_attribute("action", "refund_tribute")
         .add_message(BankMsg::Send {
             to_address: info.sender.to_string(),
-            amount: vec![tribute.amount],
+            amount: vec![tribute.funds],
         }))
 }
 
