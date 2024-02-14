@@ -1,24 +1,8 @@
 // MAIN TODOS:
-// - Handle power scaling and attenuation <- Done
 // - Add real covenant logic
-// - Question: How to design voting so that people don't just wait until the end to vote?
 // - Question: How to handle the case where a proposal is executed but the covenant fails?
 // - Covenant Question: How to deal with someone using MEV to skew the pool ratio right before the liquidity is pulled? Streaming the liquidity pull? You'd have to set up a cron job for that.
 // - Covenant Question: Can people sandwich this whole thing - covenant system has price limits - but we should allow people to retry executing the prop during the round
-// - Question: How to punish people who vote for props that lose money due to IL? Adding their liquid staked positions to the prop position is a non starter mechanically. Instead we should hit their staked positions at the end if there is IL.
-// - - Question: Should they also be exposed to upside?
-// - - Question: At what point do you punish them for the IL? At the end of the round? Should there be failsafes to pull a position once IL breaches a threshold?
-
-// Power scaling function: \left\{x<1:\ 2,\ 1<x<4:\ -5^{\left(x-4.5\right)}+1,\ x>4:\ 0\right\}
-// fn piecewise_function(x: f64) -> f64 {
-//     if x < 1.0 {
-//         2.0 // For x < 1, return 2
-//     } else if x > 4.0 {
-//         0.0 // For x > 4, return 0
-//     } else {
-//         -5.0f64.powf(x - 4.5) + 1.0 // For 1 < x < 4, calculate the expression
-//     }
-// }
 
 use cosmwasm_std::{
     entry_point, to_json_binary, BankMsg, Binary, Coin, Deps, DepsMut, Env, MessageInfo, Order,
@@ -29,7 +13,8 @@ use crate::error::ContractError;
 use crate::msg::{CountResponse, ExecuteMsg, InstantiateMsg, QueryMsg};
 use crate::state::{
     Constants, LockEntry, Proposal, Round, Tribute, Vote, CONSTANTS, LOCKS_MAP, LOCK_ID, PROP_ID,
-    PROP_MAP, ROUND_ID, ROUND_MAP, TRIBUTE_CLAIMS, TRIBUTE_ID, TRIBUTE_MAP, VOTE_MAP, WINNING_PROP,
+    PROP_MAP, ROUND_ID, ROUND_MAP, TOTAL_POWER_VOTING, TRIBUTE_CLAIMS, TRIBUTE_ID, TRIBUTE_MAP,
+    VOTE_MAP, WINNING_PROP,
 };
 use osmosis_std::types::osmosis::tokenfactory::v1beta1::{MsgBurn, MsgMint};
 
@@ -127,10 +112,8 @@ fn lock_tokens(
         lock_start: env.block.time,
         lock_end: env.block.time.plus_nanos(lock_duration),
     };
-    // increment lock_id
     let lock_id = LOCK_ID.load(deps.storage)?;
     LOCK_ID.save(deps.storage, &(lock_id + 1))?;
-
     LOCKS_MAP.save(deps.storage, (info.sender, lock_id), &lock_entry)?;
 
     Ok(Response::new().add_attribute("action", "lock_tokens"))
@@ -255,6 +238,9 @@ fn vote(
         let mut proposal = PROP_MAP.load(deps.storage, (round_id, vote.prop_id))?;
         proposal.power -= vote.power;
         PROP_MAP.save(deps.storage, (round_id, vote.prop_id), &proposal)?;
+        // Decrement total power voting
+        let total_power_voting = TOTAL_POWER_VOTING.load(deps.storage, round_id)?;
+        TOTAL_POWER_VOTING.save(deps.storage, round_id, &(total_power_voting - vote.power))?;
     }
     // Delete vote
     VOTE_MAP.remove(deps.storage, (round_id, info.sender.clone()));
@@ -296,6 +282,10 @@ fn vote(
             WINNING_PROP.save(deps.storage, round_id, &proposal_id)?;
         }
     }
+
+    // Increment total power voting
+    let total_power_voting = TOTAL_POWER_VOTING.load(deps.storage, round_id)?;
+    TOTAL_POWER_VOTING.save(deps.storage, round_id, &(total_power_voting + power))?;
 
     // Create vote in Votemap
     let vote = Vote {
@@ -448,21 +438,8 @@ fn claim_tribute(
         )));
     }
 
-    // Check that the prop won
-    let winning_prop_id = WINNING_PROP.load(deps.storage, round_id)?;
-    if winning_prop_id != proposal_id {
-        return Err(ContractError::Std(StdError::generic_err("Proposal lost")));
-    }
-
     // Look up sender's vote for the round, error if it cannot be found
     let vote = VOTE_MAP.load(deps.storage, (round_id, info.sender.clone()))?;
-
-    // Check that the sender voted for the prop
-    if vote.prop_id != proposal_id {
-        return Err(ContractError::Std(StdError::generic_err(
-            "Sender did not vote for the proposal",
-        )));
-    }
 
     // Check that the sender has not already claimed the tribute using the TRIBUTE_CLAIMS map
     if TRIBUTE_CLAIMS.may_load(deps.storage, (info.sender.clone(), tribute_id))? == Some(true) {
@@ -471,10 +448,10 @@ fn claim_tribute(
         )));
     }
 
-    // Divide sender's vote power by the prop's power to figure out their percentage
-    let proposal = PROP_MAP.load(deps.storage, (round_id, proposal_id))?;
+    // Divide sender's vote power by the total power voting to figure out their percentage
+    let total_power_voting = TOTAL_POWER_VOTING.load(deps.storage, round_id)?;
     // TODO: percentage needs to be a decimal type
-    let percentage = vote.power / proposal.power;
+    let percentage = vote.power / total_power_voting;
 
     // Load the tribute and use the percentage to figure out how much of the tribute to send them
     let tribute = TRIBUTE_MAP.load(deps.storage, (round_id, proposal_id, tribute_id))?;

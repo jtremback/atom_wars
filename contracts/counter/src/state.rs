@@ -20,7 +20,7 @@ pub const ROUND_ID: Item<u64> = Item::new("round_id");
 
 pub const TRIBUTE_ID: Item<u64> = Item::new("tribute_id");
 
-// LocksMap: key(sender_address, lock_id) -> {
+// LOCKS_MAP: key(sender_address, lock_id) -> LockEntry {
 //     funds: Coin,
 //     lock_start: Timestamp,
 //     lock_end: Timestamp
@@ -34,10 +34,11 @@ pub struct LockEntry {
     pub lock_end: Timestamp,
 }
 
-// PropMap: key((round_id, prop_id)) -> {
+// PropMap: key(round_id, prop_id) -> Proposal {
 //     round_id: u64,
-//     covenant_params,
-//     executed: bool
+//     covenant_params: String,
+//     executed: bool,
+//     power: Uint128
 // }
 pub const PROP_MAP: Map<(u64, u64), Proposal> = Map::new("prop_map");
 
@@ -49,10 +50,10 @@ pub struct Proposal {
     pub power: Uint128,
 }
 
-// VoteMap: key(round_id, sender_addr) -> {
+// VoteMap: key(round_id, sender_addr) -> Vote {
 //     prop_id: u64,
-//     sender_address: Address
-//     power: Uint128
+//     power: Uint128,
+//     tribute_claimed: bool
 // }
 pub const VOTE_MAP: Map<(u64, Addr), Vote> = Map::new("vote_map");
 
@@ -63,10 +64,9 @@ pub struct Vote {
     pub tribute_claimed: bool,
 }
 
-// RoundMap: key(round_id) -> {
+// RoundMap: key(round_id) -> Round {
 //     round_id: u64,
 //     round_end: Timestamp
-//     winners
 // }
 pub const ROUND_MAP: Map<u64, Round> = Map::new("round_map");
 
@@ -76,12 +76,12 @@ pub struct Round {
     pub round_end: Timestamp,
 }
 
-// TributeMap: key(round_id, prop_id, tribute_id) -> {
-//     sender: Address,
-//     amount: Coin
+// TributeMap: key(round_id, prop_id, tribute_id) -> Tribute {
+//     depositor: Address,
+//     funds: Coin,
+//     refunded: bool
 // }
 pub const TRIBUTE_MAP: Map<(u64, u64, u64), Tribute> = Map::new("tribute_map");
-
 #[cw_serde]
 pub struct Tribute {
     pub depositor: Addr,
@@ -89,10 +89,8 @@ pub struct Tribute {
     pub refunded: bool,
 }
 
-pub const TALLY_MAP: Map<(u64, u64), Uint128> = Map::new("tally_map");
-
 // WinningProp: key(round_id) -> prop_id
 pub const WINNING_PROP: Map<u64, u64> = Map::new("score_map");
 
-// TributeClaims: key(sender_addr, tribute_id) -> bool
-pub const TRIBUTE_CLAIMS: Map<(Addr, u64), bool> = Map::new("tribute_claims");
+// TotalPowerVoting: key(round_id) -> Uint128
+pub const TOTAL_POWER_VOTING: Map<u64, Uint128> = Map::new("total_power_voting");
