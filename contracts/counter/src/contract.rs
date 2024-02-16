@@ -1,22 +1,23 @@
 // MAIN TODOS:
+// - Query methods! We want a very complete set so that it is easy for third party tribute contracts
+// - Tests!
 // - Add real covenant logic
+// - Make it work for separate tranches
 // - Question: How to handle the case where a proposal is executed but the covenant fails?
 // - Covenant Question: How to deal with someone using MEV to skew the pool ratio right before the liquidity is pulled? Streaming the liquidity pull? You'd have to set up a cron job for that.
 // - Covenant Question: Can people sandwich this whole thing - covenant system has price limits - but we should allow people to retry executing the prop during the round
 
 use cosmwasm_std::{
-    entry_point, to_json_binary, BankMsg, Binary, Coin, Deps, DepsMut, Env, MessageInfo, Order,
-    Response, StdError, StdResult, Timestamp, Uint128,
+    entry_point, to_json_binary, BankMsg, Binary, Deps, DepsMut, Env, MessageInfo, Order, Response,
+    StdError, StdResult, Uint128,
 };
 
 use crate::error::ContractError;
 use crate::msg::{CountResponse, ExecuteMsg, InstantiateMsg, QueryMsg};
 use crate::state::{
-    Constants, LockEntry, Proposal, Round, Tribute, Vote, CONSTANTS, LOCKS_MAP, LOCK_ID, PROP_ID,
-    PROP_MAP, ROUND_ID, ROUND_MAP, TOTAL_POWER_VOTING, TRIBUTE_CLAIMS, TRIBUTE_ID, TRIBUTE_MAP,
-    VOTE_MAP, WINNING_PROP,
+    Constants, LockEntry, Proposal, Round, Vote, CONSTANTS, LOCKS_MAP, LOCK_ID, PROPOSAL_MAP,
+    PROPS_BY_SCORE, PROP_ID, ROUND_ID, ROUND_MAP, TOTAL_POWER_VOTING, VOTE_MAP,
 };
-use osmosis_std::types::osmosis::tokenfactory::v1beta1::{MsgBurn, MsgMint};
 
 #[entry_point]
 pub fn instantiate(
@@ -46,22 +47,12 @@ pub fn execute(
     match msg {
         ExecuteMsg::LockTokens { lock_duration } => lock_tokens(deps, env, info, lock_duration),
         ExecuteMsg::UnlockTokens {} => unlock_tokens(deps, env, info),
-        ExecuteMsg::CreateProposal { covenant_params } => {
-            create_proposal(deps, env, info, covenant_params)
-        }
-        ExecuteMsg::Vote { proposal_id } => vote(deps, env, info, proposal_id),
-        ExecuteMsg::Tally {} => end_round(deps, env, info),
+        ExecuteMsg::CreateProposal { covenant_params } => create_proposal(deps, covenant_params),
+        ExecuteMsg::Vote { proposal_id } => vote(deps, info, proposal_id),
+        ExecuteMsg::EndRound {} => end_round(deps, env, info),
         ExecuteMsg::ExecuteProposal { proposal_id } => {
             execute_proposal(deps, env, info, proposal_id)
         }
-        ExecuteMsg::AddTribute {
-            proposal_id,
-            round_id,
-        } => add_tribute(deps, env, info, round_id, proposal_id),
-        ExecuteMsg::RefundTribute {
-            proposal_id,
-            round_id,
-        } => refund_tribute(deps, env, info, round_id, round_id, proposal_id),
     }
 }
 
@@ -158,7 +149,7 @@ fn unlock_tokens(deps: DepsMut, env: Env, info: MessageInfo) -> Result<Response,
         }))
 }
 
-fn validate_covenant_params(covenant_params: String) -> Result<(), ContractError> {
+fn validate_covenant_params(_covenant_params: String) -> Result<(), ContractError> {
     // Validate covenant_params
     Ok(())
 }
@@ -167,12 +158,7 @@ fn validate_covenant_params(covenant_params: String) -> Result<(), ContractError
 //     Validate covenant_params
 //     Hold tribute in contract's account
 //     Create in PropMap
-fn create_proposal(
-    deps: DepsMut,
-    env: Env,
-    info: MessageInfo,
-    covenant_params: String,
-) -> Result<Response, ContractError> {
+fn create_proposal(deps: DepsMut, covenant_params: String) -> Result<Response, ContractError> {
     validate_covenant_params(covenant_params.clone())?;
 
     let round_id = ROUND_ID.load(deps.storage)?;
@@ -180,22 +166,20 @@ fn create_proposal(
     // Create proposal in PropMap
     let proposal = Proposal {
         covenant_params,
-        round_id: round_id,
+        round_id,
         executed: false,
         power: Uint128::zero(),
     };
 
     let prop_id = PROP_ID.load(deps.storage)?;
     PROP_ID.save(deps.storage, &(prop_id + 1))?;
-    PROP_MAP.save(deps.storage, (round_id, prop_id), &proposal)?;
+    PROPOSAL_MAP.save(deps.storage, (round_id, prop_id), &proposal)?;
 
     Ok(Response::new().add_attribute("action", "create_proposal"))
 }
 
 fn scale_lockup_power(lockup_time: u64, raw_power: Uint128) -> Uint128 {
     let one_month_in_nanos: u64 = 2629746000000000;
-    let three_months_in_nanos: u64 = one_month_in_nanos * 3;
-    let six_months_in_nanos: u64 = one_month_in_nanos * 6;
 
     let two: Uint128 = 2u16.into();
 
@@ -219,31 +203,59 @@ fn scale_lockup_power(lockup_time: u64, raw_power: Uint128) -> Uint128 {
     scaled_power
 }
 
-fn vote(
-    deps: DepsMut,
-    env: Env,
-    info: MessageInfo,
-    proposal_id: u64,
-) -> Result<Response, ContractError> {
+fn vote(deps: DepsMut, info: MessageInfo, proposal_id: u64) -> Result<Response, ContractError> {
+    // This voting system is designed to allow for an unlimited number of proposals and an unlimited number of votes
+    // to be created, without being vulnerable to DOS. A naive implementation, where all votes or all proposals were iterated
+    // at the end of the round could be DOSed by creating a large number of votes or proposals. This is not a problem
+    // for this implementation, but this leads to some subtlety in the implementation.
+    // I will explain the overall principle here:
+    // - The information on which proposal is winning is updated each time someone votes, instead of being calculated at the end of the round.
+    // - This information is stored in a map called PROPS_BY_SCORE, which maps the score of a proposal to the proposal id.
+    // - At the end of the round, a single access to PROPS_BY_SCORE is made to get the winning proposal.
+    // - To enable switching votes (and for other stuff too), we store the vote in VOTE_MAP.
+    // - When a user votes the second time in a round, the information about their previous vote from VOTE_MAP is used to reverse the effect of their previous vote.
+    // - This leads to slightly higher gas costs for each vote, in exchange for a much lower gas cost at the end of the round.
+
     // Load the round_id
     let round_id = ROUND_ID.load(deps.storage)?;
 
     // Load the round
     let round = ROUND_MAP.load(deps.storage, round_id)?;
 
-    // Get any existing vote and reverse it
+    // Get any existing vote for this sender and reverse it- this may be a vote for a different proposal (if they are switching their vote),
+    // or it may be a vote for the same proposal (if they have increased their power by locking more and want to update their vote).
+    // TODO: this could be made more gas-efficient by using a separate path with fewer writes if the vote is for the same proposal
     let vote = VOTE_MAP.load(deps.storage, (round_id, info.sender.clone()));
     if let Ok(vote) = vote {
-        // Reverse vote
-        let mut proposal = PROP_MAP.load(deps.storage, (round_id, vote.prop_id))?;
+        // Load the proposal in the vote
+        let mut proposal = PROPOSAL_MAP.load(deps.storage, (round_id, vote.prop_id))?;
+
+        // Remove proposal's old power in PROPS_BY_SCORE
+        PROPS_BY_SCORE.remove(
+            deps.storage,
+            (round_id, proposal.power.into(), vote.prop_id),
+        );
+
+        // Decrement proposal's power
         proposal.power -= vote.power;
-        PROP_MAP.save(deps.storage, (round_id, vote.prop_id), &proposal)?;
+
+        // Save the proposal
+        PROPOSAL_MAP.save(deps.storage, (round_id, vote.prop_id), &proposal)?;
+
+        // Add proposal's new power in PROPS_BY_SCORE
+        PROPS_BY_SCORE.save(
+            deps.storage,
+            (round_id, proposal.power.into(), vote.prop_id),
+            &vote.prop_id,
+        )?;
+
         // Decrement total power voting
         let total_power_voting = TOTAL_POWER_VOTING.load(deps.storage, round_id)?;
         TOTAL_POWER_VOTING.save(deps.storage, round_id, &(total_power_voting - vote.power))?;
+
+        // Delete vote
+        VOTE_MAP.remove(deps.storage, (round_id, info.sender.clone()));
     }
-    // Delete vote
-    VOTE_MAP.remove(deps.storage, (round_id, info.sender.clone()));
 
     // Get sender's total locked power
     let mut power: Uint128 = Uint128::zero();
@@ -265,23 +277,24 @@ fn vote(
         power += scaled_power;
     }
 
-    // Update proposal's power in propmap
-    let mut proposal = PROP_MAP.load(deps.storage, (round_id, proposal_id))?;
-    proposal.power += power;
-    PROP_MAP.save(deps.storage, (round_id, proposal_id), &proposal)?;
+    // Load the proposal being voted on
+    let mut proposal = PROPOSAL_MAP.load(deps.storage, (round_id, proposal_id))?;
 
-    // Check if winning proposal has a lower score, if so, update round's winning proposal
-    match WINNING_PROP.may_load(deps.storage, round_id)? {
-        Some(winning_prop_id) => {
-            let winning_prop = PROP_MAP.load(deps.storage, (round_id, winning_prop_id))?;
-            if proposal.power > winning_prop.power {
-                WINNING_PROP.save(deps.storage, round_id, &proposal_id)?;
-            }
-        }
-        None => {
-            WINNING_PROP.save(deps.storage, round_id, &proposal_id)?;
-        }
-    }
+    // Delete the proposal's old power in PROPS_BY_SCORE
+    PROPS_BY_SCORE.remove(deps.storage, (round_id, proposal.power.into(), proposal_id));
+
+    // Update proposal's power
+    proposal.power += power;
+
+    // Save the proposal
+    PROPOSAL_MAP.save(deps.storage, (round_id, proposal_id), &proposal)?;
+
+    // Save the proposal's new power in PROPS_BY_SCORE
+    PROPS_BY_SCORE.save(
+        deps.storage,
+        (round_id, proposal.power.into(), proposal_id),
+        &proposal_id,
+    )?;
 
     // Increment total power voting
     let total_power_voting = TOTAL_POWER_VOTING.load(deps.storage, round_id)?;
@@ -291,17 +304,16 @@ fn vote(
     let vote = Vote {
         prop_id: proposal_id,
         power,
-        tribute_claimed: false,
     };
     VOTE_MAP.save(deps.storage, (round_id, info.sender), &vote)?;
 
     Ok(Response::new().add_attribute("action", "vote"))
 }
 
-fn end_round(_deps: DepsMut, _env: Env, _info: MessageInfo) -> Result<Response, ContractError> {
+fn end_round(deps: DepsMut, _env: Env, _info: MessageInfo) -> Result<Response, ContractError> {
     // Check that round has ended by getting latest round and checking if round_end < now
-    let round = ROUND_ID.load(_deps.storage)?;
-    let round = ROUND_MAP.load(_deps.storage, round)?;
+    let round_id = ROUND_ID.load(deps.storage)?;
+    let round = ROUND_MAP.load(deps.storage, round_id)?;
 
     if round.round_end > _env.block.time {
         return Err(ContractError::Std(StdError::generic_err(
@@ -309,27 +321,30 @@ fn end_round(_deps: DepsMut, _env: Env, _info: MessageInfo) -> Result<Response, 
         )));
     }
 
-    // Start a new round
-    let round_id = round.round_id + 1;
+    // Calculate the round_end for the next round
     let round_end = _env
         .block
         .time
-        .plus_nanos(CONSTANTS.load(_deps.storage)?.round_length);
+        .plus_nanos(CONSTANTS.load(deps.storage)?.round_length);
+
+    // Increment the round_id
+    let round_id = round.round_id + 1;
+    ROUND_ID.save(deps.storage, &(round_id))?;
+    // Save the round
     ROUND_MAP.save(
-        _deps.storage,
+        deps.storage,
         round_id,
         &Round {
             round_end,
             round_id,
         },
     )?;
-    ROUND_ID.save(_deps.storage, &(round_id))?;
 
     Ok(Response::new().add_attribute("action", "tally"))
 }
 
 fn do_covenant_stuff(
-    _deps: DepsMut,
+    _deps: Deps,
     _env: Env,
     _info: MessageInfo,
     _covenant_params: String,
@@ -338,23 +353,45 @@ fn do_covenant_stuff(
     Ok(Response::new().add_attribute("action", "do_covenant_stuff"))
 }
 
+fn get_winning_prop(deps: Deps, round_id: u64) -> Result<u64, ContractError> {
+    // Iterate through PROPS_BY_SCORE to find the winning prop with the highest score
+    // TODO: I'm not quite sure if I am doing this right. The intention is to get the proposal with the highest score.
+    // To do this I am pulling off the first element of the key, which is the round_id (is sub_prefix the right function to use?)
+    // Then we iterate in descending order and take the first element that comes out. This will be the proposal with the highest score.
+    // If there are two proposals with the same score, the first one that comes out will be the one with the highest prop_id, which is fine.
+    let winning_prop_id = PROPS_BY_SCORE
+        .sub_prefix(round_id)
+        .range(deps.storage, None, None, Order::Descending)
+        .next()
+        .ok_or_else(|| ContractError::Std(StdError::generic_err("No proposals found")))??
+        .1;
+
+    Ok(winning_prop_id)
+}
+
 fn execute_proposal(
     deps: DepsMut,
     env: Env,
     info: MessageInfo,
     proposal_id: u64,
 ) -> Result<Response, ContractError> {
-    // Check that the propsal won the last round
+    // Load the last round_id
     let last_round_id = ROUND_ID.load(deps.storage)? - 1;
-    let winning_prop_id = WINNING_PROP.load(deps.storage, last_round_id)?;
+
+    // Load the winning prop_id
+    let winning_prop_id = get_winning_prop(deps.as_ref(), last_round_id)?;
+
+    // Check that this prop is the one that won
     if winning_prop_id != proposal_id {
         return Err(ContractError::Std(StdError::generic_err(
             "Proposal did not win the last round",
         )));
     }
 
+    // Load the proposal
+    let mut proposal = PROPOSAL_MAP.load(deps.storage, (last_round_id, proposal_id))?;
+
     // Check that the proposal has not already been executed
-    let mut proposal = PROP_MAP.load(deps.storage, (last_round_id, proposal_id))?;
     if proposal.executed {
         return Err(ContractError::Std(StdError::generic_err(
             "Proposal already executed",
@@ -362,171 +399,13 @@ fn execute_proposal(
     }
 
     // Execute proposal
-    // do_covenant_stuff(deps, env, info, proposal.clone().covenant_params);
+    do_covenant_stuff(deps.as_ref(), env, info, proposal.clone().covenant_params)?;
 
     // Mark proposal as executed
     proposal.executed = true;
-    PROP_MAP.save(deps.storage, (last_round_id, proposal_id), &proposal)?;
+    PROPOSAL_MAP.save(deps.storage, (last_round_id, proposal_id), &proposal)?;
 
     Ok(Response::new().add_attribute("action", "execute_proposal"))
-}
-
-fn add_tribute(
-    deps: DepsMut,
-    env: Env,
-    info: MessageInfo,
-    round_id: u64,
-    proposal_id: u64,
-) -> Result<Response, ContractError> {
-    // Check that the round is currently ongoing
-    let current_round_id = ROUND_ID.load(deps.storage)?;
-    if round_id != current_round_id {
-        return Err(ContractError::Std(StdError::generic_err(
-            "Round is not currently ongoing",
-        )));
-    }
-
-    // Check that the sender has sent funds
-    if info.funds.is_empty() {
-        return Err(ContractError::Std(StdError::generic_err(
-            "Must send funds to add tribute",
-        )));
-    }
-
-    // Check that the sender has only sent one type of coin for the tribute
-    if info.funds.len() != 1 {
-        return Err(ContractError::Std(StdError::generic_err(
-            "Must send exactly one coin",
-        )));
-    }
-
-    // Create tribute in TributeMap
-    let tribute_id = TRIBUTE_ID.load(deps.storage)?;
-    TRIBUTE_ID.save(deps.storage, &(tribute_id + 1))?;
-    let tribute = Tribute {
-        funds: info.funds[0].clone(),
-        depositor: info.sender.clone(),
-        refunded: false,
-    };
-    TRIBUTE_MAP.save(deps.storage, (round_id, proposal_id, tribute_id), &tribute)?;
-
-    Ok(Response::new().add_attribute("action", "add_tribute"))
-}
-
-// ClaimTribute(round_id, prop_id):
-//     Check that the round is ended
-//     Check that the prop won
-//     Look up sender's vote for the round
-//     Check that the sender voted for the prop
-//     Check that the sender has not already claimed the tribute
-//     Divide sender's vote power by total power voting for the prop to figure out their percentage
-//     Use the sender's percentage to send them the right portion of the tribute
-//     Mark on the sender's vote that they claimed the tribute
-fn claim_tribute(
-    deps: DepsMut,
-    env: Env,
-    info: MessageInfo,
-    round_id: u64,
-    proposal_id: u64,
-    tribute_id: u64,
-) -> Result<Response, ContractError> {
-    // Check that the round is ended by checking that the round_id is not the current round
-    let current_round_id = ROUND_ID.load(deps.storage)?;
-    if round_id == current_round_id {
-        return Err(ContractError::Std(StdError::generic_err(
-            "Round has not ended yet",
-        )));
-    }
-
-    // Look up sender's vote for the round, error if it cannot be found
-    let vote = VOTE_MAP.load(deps.storage, (round_id, info.sender.clone()))?;
-
-    // Check that the sender has not already claimed the tribute using the TRIBUTE_CLAIMS map
-    if TRIBUTE_CLAIMS.may_load(deps.storage, (info.sender.clone(), tribute_id))? == Some(true) {
-        return Err(ContractError::Std(StdError::generic_err(
-            "Sender has already claimed the tribute",
-        )));
-    }
-
-    // Divide sender's vote power by the total power voting to figure out their percentage
-    let total_power_voting = TOTAL_POWER_VOTING.load(deps.storage, round_id)?;
-    // TODO: percentage needs to be a decimal type
-    let percentage = vote.power / total_power_voting;
-
-    // Load the tribute and use the percentage to figure out how much of the tribute to send them
-    let tribute = TRIBUTE_MAP.load(deps.storage, (round_id, proposal_id, tribute_id))?;
-    let amount = Uint128::from(tribute.funds.amount * percentage);
-
-    // Mark in the TRIBUTE_CLAIMS that the sender has claimed this tribute
-    TRIBUTE_CLAIMS.save(deps.storage, (info.sender.clone(), tribute_id), &true)?;
-
-    // Send the tribute to the sender
-    Ok(Response::new()
-        .add_attribute("action", "claim_tribute")
-        .add_message(BankMsg::Send {
-            to_address: info.sender.to_string(),
-            // TODO: amount needs to be a Coin type- take calculated amount instead of entire tribute amount
-            amount: vec![Coin {
-                denom: tribute.funds.denom,
-                amount,
-            }],
-        }))
-}
-
-// RefundTribute(round_id, prop_id, tribute_id):
-//     Check that the round is ended
-//     Check that the prop lost
-//     Check that the sender is the depositor of the tribute
-//     Check that the sender has not already refunded the tribute
-//     Send the tribute back to the sender
-fn refund_tribute(
-    deps: DepsMut,
-    env: Env,
-    info: MessageInfo,
-    round_id: u64,
-    proposal_id: u64,
-    tribute_id: u64,
-) -> Result<Response, ContractError> {
-    // Check that the round is ended by checking that the round_id is not the current round
-    let current_round_id = ROUND_ID.load(deps.storage)?;
-    if round_id == current_round_id {
-        return Err(ContractError::Std(StdError::generic_err(
-            "Round has not ended yet",
-        )));
-    }
-
-    // Check that the prop lost
-    let winning_prop_id = WINNING_PROP.load(deps.storage, round_id)?;
-    if winning_prop_id == proposal_id {
-        return Err(ContractError::Std(StdError::generic_err("Proposal won")));
-    }
-
-    // Check that the sender is the depositor of the tribute
-    let mut tribute = TRIBUTE_MAP.load(deps.storage, (round_id, proposal_id, tribute_id))?;
-    if tribute.depositor != info.sender {
-        return Err(ContractError::Std(StdError::generic_err(
-            "Sender is not the depositor of the tribute",
-        )));
-    }
-
-    // Check that the sender has not already refunded the tribute
-    if tribute.refunded {
-        return Err(ContractError::Std(StdError::generic_err(
-            "Sender has already refunded the tribute",
-        )));
-    }
-
-    // Mark the tribute as refunded
-    tribute.refunded = true;
-    TRIBUTE_MAP.save(deps.storage, (round_id, proposal_id, tribute_id), &tribute)?;
-
-    // Send the tribute back to the sender
-    Ok(Response::new()
-        .add_attribute("action", "refund_tribute")
-        .add_message(BankMsg::Send {
-            to_address: info.sender.to_string(),
-            amount: vec![tribute.funds],
-        }))
 }
 
 #[cfg_attr(not(feature = "library"), entry_point)]
@@ -536,7 +415,11 @@ pub fn query(deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
     }
 }
 
+// pub fn query_winning_proposal(deps: Deps) -> StdResult<Binary> {
+//     let winning_prop_id = get_winning_prop(deps)?;
+//     to_json_binary(&winning_prop_id)
+// }
+
 pub fn query_count(_deps: Deps) -> StdResult<Binary> {
-    let constant = CONSTANTS.load(_deps.storage)?;
     to_json_binary(&(CountResponse { count: 0 }))
 }

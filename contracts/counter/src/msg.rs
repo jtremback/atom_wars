@@ -1,4 +1,3 @@
-use cosmwasm_std::Coin;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -15,10 +14,8 @@ pub enum ExecuteMsg {
     UnlockTokens {},
     CreateProposal { covenant_params: String },
     Vote { proposal_id: u64 },
-    Tally {},
+    EndRound {},
     ExecuteProposal { proposal_id: u64 },
-    AddTribute { round_id: u64, proposal_id: u64 },
-    RefundTribute { round_id: u64, proposal_id: u64 },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
