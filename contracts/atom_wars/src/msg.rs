@@ -1,3 +1,4 @@
+use cosmwasm_std::Uint128;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -5,6 +6,7 @@ use serde::{Deserialize, Serialize};
 pub struct InstantiateMsg {
     pub denom: String,
     pub round_length: u64,
+    pub total_pool: Uint128,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
@@ -15,7 +17,7 @@ pub enum ExecuteMsg {
     CreateProposal { covenant_params: String },
     Vote { proposal_id: u64 },
     EndRound {},
-    ExecuteProposal { proposal_id: u64 },
+    // ExecuteProposal { proposal_id: u64 },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
