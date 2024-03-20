@@ -8,6 +8,7 @@ pub const CONSTANTS: Item<Constants> = Item::new("constants");
 pub struct Constants {
     pub denom: String,
     pub round_length: u64,
+    pub total_pool: Uint128,
 }
 
 pub const LOCK_ID: Item<u64> = Item::new("lock_id");
@@ -42,6 +43,8 @@ pub struct Proposal {
     pub covenant_params: String,
     pub executed: bool,
     pub power: Uint128,
+    pub percentage: Uint128,
+    pub amount: Uint128,
 }
 
 // VOTE_MAP: key(round_id, sender_addr) -> Vote {

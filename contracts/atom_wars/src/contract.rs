@@ -29,6 +29,7 @@ pub fn instantiate(
     let state = Constants {
         denom: msg.denom.clone(),
         round_length: msg.round_length,
+        total_pool: msg.total_pool,
     };
     CONSTANTS.save(deps.storage, &state)?;
     Ok(Response::new()
@@ -50,9 +51,9 @@ pub fn execute(
         ExecuteMsg::CreateProposal { covenant_params } => create_proposal(deps, covenant_params),
         ExecuteMsg::Vote { proposal_id } => vote(deps, info, proposal_id),
         ExecuteMsg::EndRound {} => end_round(deps, env, info),
-        ExecuteMsg::ExecuteProposal { proposal_id } => {
-            execute_proposal(deps, env, info, proposal_id)
-        }
+        // ExecuteMsg::ExecuteProposal { proposal_id } => {
+        //     execute_proposal(deps, env, info, proposal_id)
+        // }
     }
 }
 
@@ -169,6 +170,8 @@ fn create_proposal(deps: DepsMut, covenant_params: String) -> Result<Response, C
         round_id,
         executed: false,
         power: Uint128::zero(),
+        percentage: Uint128::zero(),
+        amount: Uint128::zero(),
     };
 
     let prop_id = PROP_ID.load(deps.storage)?;
@@ -310,19 +313,19 @@ fn vote(deps: DepsMut, info: MessageInfo, proposal_id: u64) -> Result<Response, 
     Ok(Response::new().add_attribute("action", "vote"))
 }
 
-fn end_round(deps: DepsMut, _env: Env, _info: MessageInfo) -> Result<Response, ContractError> {
+fn end_round(deps: DepsMut, env: Env, _info: MessageInfo) -> Result<Response, ContractError> {
     // Check that round has ended by getting latest round and checking if round_end < now
     let round_id = ROUND_ID.load(deps.storage)?;
     let round = ROUND_MAP.load(deps.storage, round_id)?;
 
-    if round.round_end > _env.block.time {
+    if round.round_end > env.block.time {
         return Err(ContractError::Std(StdError::generic_err(
             "Round has not ended yet",
         )));
     }
 
     // Calculate the round_end for the next round
-    let round_end = _env
+    let round_end = env
         .block
         .time
         .plus_nanos(CONSTANTS.load(deps.storage)?.round_length);
@@ -353,60 +356,100 @@ fn do_covenant_stuff(
     Ok(Response::new().add_attribute("action", "do_covenant_stuff"))
 }
 
-fn get_winning_prop(deps: Deps, round_id: u64) -> Result<u64, ContractError> {
-    // Iterate through PROPS_BY_SCORE to find the winning prop with the highest score
-    // TODO: I'm not quite sure if I am doing this right. The intention is to get the proposal with the highest score.
-    // To do this I am pulling off the first element of the key, which is the round_id (is sub_prefix the right function to use?)
-    // Then we iterate in descending order and take the first element that comes out. This will be the proposal with the highest score.
-    // If there are two proposals with the same score, the first one that comes out will be the one with the highest prop_id, which is fine.
-    let winning_prop_id = PROPS_BY_SCORE
+fn get_top_props(deps: Deps, round_id: u64, num: usize) -> Result<Vec<Proposal>, ContractError> {
+    // Iterate through PROPS_BY_SCORE to find the top ten props
+    let top_prop_ids: Vec<u64> = PROPS_BY_SCORE
         .sub_prefix(round_id)
         .range(deps.storage, None, None, Order::Descending)
-        .next()
-        .ok_or_else(|| ContractError::Std(StdError::generic_err("No proposals found")))??
-        .1;
+        .take(num)
+        .map(|x| match x {
+            Ok((_, prop_id)) => prop_id,
+            Err(_) => 0, // Handle the error case appropriately
+        })
+        .collect();
 
-    Ok(winning_prop_id)
-}
+    let mut top_props = vec![];
 
-fn execute_proposal(
-    deps: DepsMut,
-    env: Env,
-    info: MessageInfo,
-    proposal_id: u64,
-) -> Result<Response, ContractError> {
-    // Load the last round_id
-    let last_round_id = ROUND_ID.load(deps.storage)? - 1;
-
-    // Load the winning prop_id
-    let winning_prop_id = get_winning_prop(deps.as_ref(), last_round_id)?;
-
-    // Check that this prop is the one that won
-    if winning_prop_id != proposal_id {
-        return Err(ContractError::Std(StdError::generic_err(
-            "Proposal did not win the last round",
-        )));
+    for prop_id in top_prop_ids {
+        let prop = PROPOSAL_MAP.load(deps.storage, (round_id, prop_id))?;
+        top_props.push(prop);
     }
 
-    // Load the proposal
-    let mut proposal = PROPOSAL_MAP.load(deps.storage, (last_round_id, proposal_id))?;
-
-    // Check that the proposal has not already been executed
-    if proposal.executed {
-        return Err(ContractError::Std(StdError::generic_err(
-            "Proposal already executed",
-        )));
+    // loop to find sum of power
+    let mut sum_power = 0;
+    for prop in top_props {
+        sum_power += prop.power.u128();
     }
 
-    // Execute proposal
-    do_covenant_stuff(deps.as_ref(), env, info, proposal.clone().covenant_params)?;
+    // // loop to find percentage of power
+    // for mut prop in top_props {
+    //     prop.percentage = (prop.power.u128() / sum_power).into();
+    // }
 
-    // Mark proposal as executed
-    proposal.executed = true;
-    PROPOSAL_MAP.save(deps.storage, (last_round_id, proposal_id), &proposal)?;
+    // // Multiply by total pool to find exact amount
+    // for mut prop in top_props {
+    //     prop.amount = prop.percentage * CONSTANTS.load(deps.storage)?.total_pool;
+    // }
 
-    Ok(Response::new().add_attribute("action", "execute_proposal"))
+    // for top_props {
+    //     prop.percentage = (prop.power.u128() / sum_power).into();
+    //     prop.amount = prop.percentage * CONSTANTS.load(deps.storage)?.total_pool;
+    // }
+
+    let total_pool = CONSTANTS.load(deps.storage)?.total_pool;
+
+    // return top props
+    return Ok(top_props
+        .into_iter() // Change from iter() to into_iter()
+        .map(|mut prop| {
+            // Change to mutable binding
+            prop.percentage = (prop.power.u128() / sum_power).into();
+            prop.amount = prop.percentage * total_pool;
+            prop
+        })
+        .collect());
 }
+
+// TODO: we need to do this differently to allocate liquidity proportionally to the top props instead of the old
+// winner takes all method
+// fn execute_proposal(
+//     deps: DepsMut,
+//     env: Env,
+//     info: MessageInfo,
+//     proposal_id: u64,
+// ) -> Result<Response, ContractError> {
+//     // Load the last round_id
+//     let last_round_id = ROUND_ID.load(deps.storage)? - 1;
+
+//     // Load the winning prop_id
+//     let winning_prop_id = get_winning_prop(deps.as_ref(), last_round_id)?;
+
+//     // Check that this prop is the one that won
+//     if winning_prop_id != proposal_id {
+//         return Err(ContractError::Std(StdError::generic_err(
+//             "Proposal did not win the last round",
+//         )));
+//     }
+
+//     // Load the proposal
+//     let mut proposal = PROPOSAL_MAP.load(deps.storage, (last_round_id, proposal_id))?;
+
+//     // Check that the proposal has not already been executed
+//     if proposal.executed {
+//         return Err(ContractError::Std(StdError::generic_err(
+//             "Proposal already executed",
+//         )));
+//     }
+
+//     // Execute proposal
+//     do_covenant_stuff(deps.as_ref(), env, info, proposal.clone().covenant_params)?;
+
+//     // Mark proposal as executed
+//     proposal.executed = true;
+//     PROPOSAL_MAP.save(deps.storage, (last_round_id, proposal_id), &proposal)?;
+
+//     Ok(Response::new().add_attribute("action", "execute_proposal"))
+// }
 
 #[cfg_attr(not(feature = "library"), entry_point)]
 pub fn query(deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {

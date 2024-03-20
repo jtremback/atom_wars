@@ -1,7 +1,5 @@
 [workspace]
-members = [
-    "contracts/counter",
-]
+members = ["contracts/atom_wars"]
 
 [profile.release]
 opt-level = 3

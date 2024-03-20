@@ -9,6 +9,7 @@ fn add_tribute(
     proposal_id: u64,
 ) -> Result<Response, ContractError> {
     // Check that the round is currently ongoing
+    // TODO: change to contract query
     let current_round_id = ROUND_ID.load(deps.storage)?;
     if round_id != current_round_id {
         return Err(ContractError::Std(StdError::generic_err(
